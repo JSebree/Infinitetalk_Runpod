@@ -1,14 +1,15 @@
 # Use specific version of nvidia cuda image
 FROM wlsdml1114/multitalk-base:1.4 as runtime
 
-# Install wget (for URL downloads) and ffmpeg (for video I/O, provides ffprobe)
-RUN apt-get update && apt-get install -y wget ffmpeg && rm -rf /var/lib/apt/lists/*
+# Install wget (for URL downloads), ffmpeg (for video I/O, provides ffprobe), and libsndfile1 (for librosa)
+RUN apt-get update && apt-get install -y wget ffmpeg libsndfile1 && rm -rf /var/lib/apt/lists/*
 
 RUN pip install -U "huggingface_hub[hf_transfer]"
-RUN pip install runpod websocket-client librosa boto3 requests
+RUN pip install --no-cache-dir runpod websocket-client librosa boto3 requests
 
 WORKDIR /
 ENV PYTHONUNBUFFERED=1
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git && \
     cd /ComfyUI && \
