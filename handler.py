@@ -15,6 +15,12 @@ import librosa
 import traceback
 import boto3
 import string
+import re
+
+SAGE_ERROR_PATTERNS = (
+    "SM90 kernel is not available",
+    "no kernel image is available for execution on the device",
+)
 
 # ---------------------------
 # Logging
@@ -71,6 +77,44 @@ def _derive_output_name(job_input: dict, task_id: str, src_path: str) -> str:
         ext = ".gif"
     name = f"{base}{ext}"
     return _sanitize_filename(name, f"{task_id}{ext}")
+
+
+# ---------------------------
+# Attention backend helpers
+# ---------------------------
+def _apply_attention_overrides(prompt_dict: dict, disable_sage: bool) -> None:
+    """Best-effort switch away from SageAttention inside the workflow JSON.
+    We look for common keys some custom nodes expose and change them if found.
+    Safe no-ops if keys don't exist.
+    """
+    if not isinstance(prompt_dict, dict):
+        return
+
+    for _, node in prompt_dict.items():
+        try:
+            inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
+            if not isinstance(inputs, dict):
+                continue
+            # Generic switches seen in various nodes
+            if disable_sage:
+                # Prefer explicit backend key if available
+                if "attention_backend" in inputs:
+                    inputs["attention_backend"] = "sdpa"  # alternatives: xformers/sdpa
+                # Booleans used by some wrappers
+                for k in ("use_sage_attention", "enable_sage_attention", "sage_attention"):
+                    if k in inputs:
+                        inputs[k] = False
+                # Some nodes pack options in a dict
+                cfg = inputs.get("options")
+                if isinstance(cfg, dict):
+                    if "attention_backend" in cfg:
+                        cfg["attention_backend"] = "sdpa"
+                    for k in ("use_sage_attention", "enable_sage_attention", "sage_attention"):
+                        if k in cfg:
+                            cfg[k] = False
+        except Exception:
+            # Never let best-effort tweaks break the run
+            continue
 
 
 # ---------------------------
@@ -360,6 +404,23 @@ def handler(job):
     logger.info(f"Received job input: {job_input}")
     logger.info(f"Task ID: {task_id}")
 
+    # New: runtime flags and GPU capability capture
+    disable_sage_env = os.getenv("DISABLE_SAGEATTN", "0") == "1"
+    disable_sage_job = bool(job_input.get("disable_sageattention") or job_input.get("disable_sage"))
+    disable_sage = disable_sage_env or disable_sage_job
+
+    # Optional override of workflow path from the API (lets you ship a safe variant without rebuilding)
+    workflow_override = job_input.get("workflow_override_path")
+
+    # Record device capability if available (debug only)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            cc = torch.cuda.get_device_capability()
+            logger.info(f"CUDA Compute Capability detected by handler: {cc}")
+    except Exception:
+        pass
+
     try:
         # Input type and speaker count
         input_type = job_input.get("input_type", "image")          # "image" or "video"
@@ -367,7 +428,8 @@ def handler(job):
         logger.info(f"Workflow type: {input_type}, persons: {person_count}")
 
         # Workflow path
-        workflow_path = get_workflow_path(input_type, person_count)
+        wf_default = get_workflow_path(input_type, person_count)
+        workflow_path = workflow_override or wf_default
         logger.info(f"Using workflow: {workflow_path}")
 
         # Media input
@@ -445,6 +507,9 @@ def handler(job):
         # Configure workflow nodes
         # ---------------------------
         prompt = load_workflow(workflow_path)
+        # Best-effort: honor disable_sage* flags by tweaking known keys
+        if disable_sage:
+            _apply_attention_overrides(prompt, disable_sage=True)
 
         if input_type == "image":
             # I2V: set image input
@@ -502,13 +567,49 @@ def handler(job):
                     return error_envelope(task_id, "websocket_timeout", "WebSocket connect timed out (3 minutes)")
                 time.sleep(5)
 
+        retry_without_sage = False
+        prompt_id = None
         try:
             videos_by_node, files_by_node, prompt_id = get_videos(ws, prompt, input_type, person_count)
+        except Exception as e:
+            msg = str(e)
+            if any(pat in msg for pat in SAGE_ERROR_PATTERNS) and not disable_sage:
+                logger.warning("Detected SageAttention kernel error; retrying once with disable_sageattention=True")
+                retry_without_sage = True
+            else:
+                raise
         finally:
             try:
                 ws.close()
             except Exception:
                 pass
+
+        if retry_without_sage:
+            # Reconnect and retry once with Sage disabled
+            disable_sage = True
+            # Reload workflow (honor override if provided)
+            prompt = load_workflow(workflow_path)
+            _apply_attention_overrides(prompt, disable_sage=True)
+
+            # Re-open WS
+            ws = websocket.WebSocket()
+            for attempt in range(max_ws_attempts):
+                try:
+                    ws.connect(ws_url)
+                    logger.info(f"WebSocket connected (retry, attempt {attempt+1})")
+                    break
+                except Exception as e:
+                    logger.warning(f"WebSocket connect failed (retry, attempt {attempt+1}/{max_ws_attempts}): {e}")
+                    if attempt == max_ws_attempts - 1:
+                        return error_envelope(task_id, "websocket_timeout", "WebSocket connect timed out on retry (3 minutes)")
+                    time.sleep(5)
+            try:
+                videos_by_node, files_by_node, prompt_id = get_videos(ws, prompt, input_type, person_count)
+            finally:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
 
         # Prefer file path for upload; fall back to base64 if needed
         first_file_path = None
@@ -552,7 +653,8 @@ def handler(job):
                     "person_count": person_count,
                     "width": width,
                     "height": height,
-                    "max_frame": max_frame
+                    "max_frame": max_frame,
+                    "disable_sageattention": bool(disable_sage)
                 }
             )
 
@@ -575,7 +677,8 @@ def handler(job):
                     "person_count": person_count,
                     "width": width,
                     "height": height,
-                    "max_frame": max_frame
+                    "max_frame": max_frame,
+                    "disable_sageattention": bool(disable_sage)
                 }
             )
 
@@ -584,11 +687,24 @@ def handler(job):
 
     except Exception as e:
         # Structured error envelope with traceback
+        msg = str(e)
+        trace_str = traceback.format_exc()
+        if any(pat in msg for pat in SAGE_ERROR_PATTERNS):
+            details = {
+                "hint": "SageAttention CUDA kernels are unavailable for this GPU/build. Retry ran without Sage if possible.",
+                "workarounds": {
+                    "disable_at_runtime": "Set DISABLE_SAGEATTN=1 or pass disable_sageattention=true in job input.",
+                    "pin_stack": "Pin Torch/CUDA/xformers/flash-attn/SageAttention and compile for sm_80 and sm_90.",
+                    "device": "On A100, Sage needs sm_80 build; on H100, it needs sm_90 build."
+                }
+            }
+            return error_envelope(task_id, code="gpu_kernel_mismatch", message=msg, details=details, trace=trace_str)
+
         return error_envelope(
             task_id=task_id,
             code="internal_error",
-            message=str(e),
-            trace=traceback.format_exc()
+            message=msg,
+            trace=trace_str
         )
 
 
