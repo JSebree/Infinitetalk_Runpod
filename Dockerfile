@@ -1,5 +1,5 @@
 # Use specific version of nvidia cuda image
-FROM wlsdml1114/multitalk-base:1.4 as runtime
+FROM wlsdml1114/multitalk-base:1.7 as runtime
 
 # Install wget (for URL downloads), ffmpeg (for video I/O, provides ffprobe), and libsndfile1 (for librosa)
 RUN apt-get update && apt-get install -y wget ffmpeg libsndfile1 && rm -rf /var/lib/apt/lists/*
