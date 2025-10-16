@@ -1,3 +1,4 @@
+
 import runpod
 from runpod.serverless.utils import rp_upload  # kept for potential future upload usage
 import os
@@ -15,6 +16,19 @@ import librosa
 import traceback
 import boto3
 import string
+
+# ---------------------------
+# Attention backend safety toggles (to avoid SM90 SageAttention crashes)
+# ---------------------------
+# Default to disabling SageAttention in WanVideoWrapper unless explicitly overridden.
+# This prevents "SM90 kernel is not available" assertion crashes on H100 when the
+# installed sageattention wheel doesn't include sm90 kernels for the current CUDA/Torch.
+os.environ.setdefault("WAN_DISABLE_SAGEATTN", os.getenv("WAN_DISABLE_SAGEATTN", "1"))
+# Prefer a safe SDPA backend; if FlashAttention2 is present in the image it will be used,
+# otherwise fall back to math which is universal (slower but stable).
+os.environ.setdefault("PYTORCH_SDP_BACKEND", os.getenv("PYTORCH_SDP_BACKEND", "math"))
+# Avoid some inductor fused SDPA edge cases on mixed stacks.
+os.environ.setdefault("TORCHINDUCTOR_DISABLE_FUSED_SDP", os.getenv("TORCHINDUCTOR_DISABLE_FUSED_SDP", "1"))
 
 # ---------------------------
 # Logging
@@ -370,6 +384,17 @@ def handler(job):
         workflow_path = get_workflow_path(input_type, person_count)
         logger.info(f"Using workflow: {workflow_path}")
 
+        # Optional per-request overrides for attention backends
+        disable_sage = str(job_input.get("disable_sageattention", os.environ.get("WAN_DISABLE_SAGEATTN", "1"))).lower() in ("1","true","yes")
+        sdp_backend = job_input.get("sdp_backend", os.environ.get("PYTORCH_SDP_BACKEND", "math"))
+
+        # Apply overrides for this process (ComfyUI reads env at import; this still documents intent
+        # and helps when ComfyUI is launched from the same process/image with these envs)
+        os.environ["WAN_DISABLE_SAGEATTN"] = "1" if disable_sage else "0"
+        os.environ["PYTORCH_SDP_BACKEND"] = sdp_backend
+
+        logger.info(f"Attention config → WAN_DISABLE_SAGEATTN={os.environ['WAN_DISABLE_SAGEATTN']}, PYTORCH_SDP_BACKEND={os.environ['PYTORCH_SDP_BACKEND']}")
+
         # Media input
         if input_type == "image":
             if "image_path" in job_input:
@@ -583,12 +608,37 @@ def handler(job):
         return error_envelope(task_id, "no_video_found", "No video was produced by the workflow.")
 
     except Exception as e:
-        # Structured error envelope with traceback
+        # Structured error envelope with traceback and special-casing SageAttention SM90 assertion
+        tb = traceback.format_exc()
+        msg = str(e)
+        if "SM90 kernel is not available" in msg or "sageattn_qk_int8_pv_fp8_cuda_sm90" in tb:
+            hint = {
+                "hint": "SageAttention failed to load SM90 kernels on H100. The fastest workaround is to disable SageAttention.",
+                "what_to_do": {
+                    "set_env": {
+                        "WAN_DISABLE_SAGEATTN": "1",
+                        "PYTORCH_SDP_BACKEND": os.environ.get("PYTORCH_SDP_BACKEND", "math"),
+                        "TORCHINDUCTOR_DISABLE_FUSED_SDP": os.environ.get("TORCHINDUCTOR_DISABLE_FUSED_SDP", "1")
+                    },
+                    "or_per_request": {
+                        "disable_sageattention": True,
+                        "sdp_backend": os.environ.get("PYTORCH_SDP_BACKEND", "math")
+                    },
+                    "long_term": "Install a sageattention wheel built for your exact Torch/CUDA with sm90 support."
+                }
+            }
+            return error_envelope(
+                task_id=task_id,
+                code="attention_backend_incompatible",
+                message="SageAttention SM90 kernels are unavailable for this image (H100).",
+                details=hint,
+                trace=tb
+            )
         return error_envelope(
             task_id=task_id,
             code="internal_error",
-            message=str(e),
-            trace=traceback.format_exc()
+            message=msg,
+            trace=tb
         )
 
 
