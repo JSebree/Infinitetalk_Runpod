@@ -45,18 +45,33 @@ server_address = os.getenv('SERVER_ADDRESS', '127.0.0.1')
 client_id = str(uuid.uuid4())
 
 # ---------------------------
-# DigitalOcean Spaces client
+# DigitalOcean Spaces client (lazy init to avoid build-time import failures)
 # ---------------------------
-_SPACES_ENDPOINT = os.environ["SPACES_ENDPOINT_URL"]
+_SPACES_ENDPOINT = os.environ.get("SPACES_ENDPOINT_URL")
 _REGION          = os.environ.get("SPACES_REGION", "")
-_BUCKET          = os.environ["SPACES_BUCKET_NAME"]
-_S3 = boto3.client(
-    "s3",
-    region_name=_REGION,
-    endpoint_url=_SPACES_ENDPOINT,
-    aws_access_key_id=os.environ["SPACES_ACCESS_KEY_ID"],
-    aws_secret_access_key=os.environ["SPACES_SECRET_ACCESS_KEY"]
-)
+_BUCKET          = os.environ.get("SPACES_BUCKET_NAME")
+_S3 = None
+
+def _require_spaces_env():
+    missing = []
+    for key in ("SPACES_ENDPOINT_URL", "SPACES_BUCKET_NAME", "SPACES_ACCESS_KEY_ID", "SPACES_SECRET_ACCESS_KEY"):
+        if not os.environ.get(key):
+            missing.append(key)
+    if missing:
+        raise RuntimeError(f"Missing DigitalOcean Spaces env vars: {', '.join(missing)}")
+
+def _get_s3():
+    global _S3
+    if _S3 is None:
+        _require_spaces_env()
+        _S3 = boto3.client(
+            "s3",
+            region_name=os.environ.get("SPACES_REGION", ""),
+            endpoint_url=os.environ["SPACES_ENDPOINT_URL"],
+            aws_access_key_id=os.environ["SPACES_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["SPACES_SECRET_ACCESS_KEY"]
+        )
+    return _S3
 
 # ---------------------------
 # Output naming helpers
@@ -836,13 +851,13 @@ def handler(job):
             # Derive output name and folder; upload to DO Spaces as public-read
             out_name = _derive_output_name(job_input, task_id, first_file_path)
             out_key  = f"infinitetalk_out/{out_name}"
-            _S3.upload_file(
+            _get_s3().upload_file(
                 Filename=first_file_path,
-                Bucket=_BUCKET,
+                Bucket=os.environ["SPACES_BUCKET_NAME"],
                 Key=out_key,
                 ExtraArgs={"ACL": "public-read"}
             )
-            public_url = f"{_SPACES_ENDPOINT}/{_BUCKET}/{out_key}"
+            public_url = f"{os.environ['SPACES_ENDPOINT_URL']}/{os.environ['SPACES_BUCKET_NAME']}/{out_key}"
 
             latency_ms = (time.time() - t0) * 1000.0
             return success_envelope(

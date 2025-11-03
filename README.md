@@ -264,3 +264,32 @@ This project is based on the following original repository. All rights to the mo
 ## 📄 License
 
 The original InfiniteTalk project follows the Apache 2.0 License. This template also adheres to that license.
+
+
+Multi-speaker with face_map
+
+{
+  "input": {
+    "input_type": "image",
+    "person_count": "multi",
+
+    "image_url": "https://cdn.yoursite.com/keyframes/shot_01.jpg",
+    "multi_speaker_wav_url": "https://spaces.your-bucket.com/audio/shot01_mix.wav",
+
+    "segments": [
+      { "start": 0.00, "end": 2.40, "voice_id": "d9454159-88bc-4f07-abef-310daec98f5b" },
+      { "start": 2.40, "end": 4.85, "voice_id": "4080632d-4364-44f2-9e27-451574f1b96f" },
+      { "start": 4.85, "end": 6.90, "voice_id": "d9454159-88bc-4f07-abef-310daec98f5b" }
+    ],
+
+    "face_map": {
+      "d9454159-88bc-4f07-abef-310daec98f5b": "A",
+      "4080632d-4364-44f2-9e27-451574f1b96f": "B"
+    },
+
+    "prompt": "Two people conversing; accurate lip sync; subtle blinks; preserve lighting.",
+    "width": 768,
+    "height": 768,
+    "output_name": "italk_shot01_full_convo"
+  }
+}
